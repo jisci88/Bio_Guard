@@ -9,3 +9,9 @@
 * **저장소:** [Eulerian-Video-Magnification](https://github.com/joeljose/Eulerian-Video-Magnification)
 * **주요 참고 파일:** `evm.py` (핵심 증폭 로직)
 * **활용 계획:** 환자 안면의 혈류 변화 시각화 및 실시간 스트리밍 연동
+
+
+
+
+심박수, 호흡수 정확하게 측정해주는 유료 라이브러리
+https://www.rouast.com/
