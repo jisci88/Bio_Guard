@@ -18,3 +18,4 @@
 *
 심박수, 호흡수 정확하게 측정해주는 유료 라이브러리
 https://www.rouast.com/
+vitallens 설치, ffmpeg 설치 등 환경 구성이 불편
