@@ -1,0 +1,50 @@
+아래 코드로 교체함
+cv -> picamera
+
+    def __process_video_capture(self, vid_path=None, api=None):
+        from picamera2 import Picamera2
+        import time
+        import numpy as np
+
+        picam2 = Picamera2()
+
+        config = picam2.create_video_configuration(
+            main={
+                "size": (640, 480),
+                "format": "RGB888"
+            }
+        )
+
+        picam2.configure(config)
+        picam2.start()
+
+        time.sleep(1)
+
+        with self:
+            while self.alive:
+                img = picam2.capture_array()
+                ts = time.time()
+
+                if img is None:
+                    break
+
+                # Picamera2 프레임을 detector가 안전하게 받을 수 있게 정리
+                img = np.asarray(img)
+
+                # 혹시 4채널로 들어오면 앞 3채널만 사용
+                if img.ndim == 3 and img.shape[2] == 4:
+                    img = img[:, :, :3]
+
+                # dtype 보정
+                if img.dtype != np.uint8:
+                    img = img.astype(np.uint8)
+
+                # 메모리 연속 배열로 변환
+                img = np.ascontiguousarray(img)
+
+                self.update_frame(img, ts)
+
+        picam2.stop()
+        picam2.close()
+
+        return self
