@@ -1,468 +1,454 @@
+"""
+open-rppg 실측값을 Tkinter 대시보드로 표시한다.
+
+  심박수    : vital_monitor.OpenRppgVitalTracker (model.hr)
+  호흡수    : 동일 tracker (hrv["breathingrate"] * 60)
+  PPG 파형  : model.bvp(start=-6)
+  호흡 파형 : model.bvp(raw=True, start=-30)을 0.1~0.5Hz 대역통과.
+              open-rppg는 호흡 파형을 직접 주지 않으므로,
+              BVP의 호흡성 진폭 변동(RIIV)을 뽑아 파형으로 쓴다.
+  체온      : 측정 수단 없음. 값은 N/A, 트렌드는 NO SENSOR로 유지한다.
+
+스레드 규칙:
+  rppg / OpenCV 호출은 VitalWorker 스레드에서만,
+  Tk 위젯 갱신은 메인 스레드에서만 한다. 둘 사이는 락으로 보호된
+  스냅샷 dict 하나로만 주고받는다.
+
+실행:
+    python vital_dashboard.py --camera 0
+"""
+
 import argparse
-from collections import deque
-import math
-import os
 import threading
 import time
 import tkinter as tk
-from tkinter import ttk
 
-import cv2
 import numpy as np
+from scipy.signal import butter, filtfilt
+
 import rppg
 
-from vital_anomaly import VitalAnomalyDetector
+from vital_monitor import OpenRppgVitalTracker
+
+# ══════════════════════════════════════════════════════
+#  색상
+# ══════════════════════════════════════════════════════
+
+BG = "#12151a"
+PANEL = "#232830"
+CARD_HR = "#1c2b1f"
+CARD_RR = "#1b2733"
+CARD_TEMP = "#2c1f21"
+
+FG_LABEL = "#c5cdd8"
+FG_DIM = "#6b7280"
+
+HR_COLOR = "#3ce85a"
+RR_COLOR = "#5eb3f5"
+TEMP_COLOR = "#f08080"
 
 
 # ══════════════════════════════════════════════════════
-#  실시간 BVP/rPPG 신호 정규화 버퍼 (Min-Max Scaler)
+#  측정 워커
 # ══════════════════════════════════════════════════════
-class SignalNormalizer:
 
-  def __init__(self, window_size=90):
-    self.buffer = deque(maxlen=window_size)
-
-  def normalize(self, val):
-    if not np.isfinite(val) or val == 0.0:
-      return 0.0
-
-    self.buffer.append(val)
-    if len(self.buffer) < 10:
-      return 0.0
-
-    min_v = min(self.buffer)
-    max_v = max(self.buffer)
-
-    if max_v == min_v:
-      return 0.0
-
-    # -1.0 ~ 1.0 범위 변환
-    norm = 2.0 * (val - min_v) / (max_v - min_v) - 1.0
-    return max(-1.0, min(1.0, norm))
-
-
-# ══════════════════════════════════════════════════════
-#  Tkinter 의료용 파형 렌더러 (Sweep Bar)
-# ══════════════════════════════════════════════════════
-class SweepWaveformCanvas(tk.Canvas):
-
-  def __init__(self, parent, color='#3fb950', speed=2.5, **kwargs):
-    super().__init__(parent, bg='#161b22', highlightthickness=0, **kwargs)
-    self.color = color
-    self.speed = speed
-    self.x = 0
-    self.last_y = None
-    self.clear_width = 15
-
-  def add_sample(self, val):
-    w = self.winfo_width()
-    h = self.winfo_height()
-    if w <= 1 or h <= 1:
-      return
-
-    margin = 8
-    draw_h = h - margin * 2
-    y = margin + (1.0 - (val + 1.0) / 2.0) * draw_h
-
-    next_x = (self.x + self.speed) % w
-
-    if next_x < self.x:
-      self.create_rectangle(
-          self.x, 0, w, h, fill='#161b22', outline='', tags='erase'
-      )
-      self.create_rectangle(
-          0, 0, self.clear_width, h, fill='#161b22', outline='', tags='erase'
-      )
-    else:
-      self.create_rectangle(
-          self.x,
-          0,
-          self.x + self.clear_width,
-          h,
-          fill='#161b22',
-          outline='',
-          tags='erase',
-      )
-
-    if self.last_y is not None and next_x >= self.x:
-      self.create_line(
-          self.x,
-          self.last_y,
-          next_x,
-          y,
-          fill=self.color,
-          width=2,
-          capstyle='round',
-      )
-
-    self.x = next_x
-    self.last_y = y
-
-
-# ══════════════════════════════════════════════════════
-#  Tkinter 메인 대시보드 GUI
-# ══════════════════════════════════════════════════════
-class BioGuardianTkApp(tk.Tk):
-
-  def __init__(self):
-    super().__init__()
-    self.title('Bio-Guardian Patient Monitor')
-    self.geometry('960x600')
-    self.configure(bg='#0d1117')
-
-    self._setup_ui()
-
-  def _setup_ui(self):
-    # Header Bar
-    header = tk.Frame(self, bg='#161b22', height=45)
-    header.pack(fill='x', padx=10, pady=(10, 5))
-
-    title_label = tk.Label(
-        header,
-        text='BIO-GUARDIAN  |  Patient Vital Sign Monitor',
-        font=('Helvetica', 13, 'bold'),
-        fg='#f0f6fc',
-        bg='#161b22',
-    )
-    title_label.pack(side='left', padx=15, pady=8)
-
-    self.lbl_fps = tk.Label(
-        header,
-        text='-- FPS',
-        font=('Helvetica', 10, 'bold'),
-        fg='#8b949e',
-        bg='#161b22',
-    )
-    self.lbl_fps.pack(side='right', padx=15)
-
-    self.lbl_face = tk.Label(
-        header,
-        text='● Face Seeking',
-        font=('Helvetica', 10, 'bold'),
-        fg='#d29922',
-        bg='#161b22',
-    )
-    self.lbl_face.pack(side='right', padx=10)
-
-    # Main Frame
-    main_frame = tk.Frame(self, bg='#0d1117')
-    main_frame.pack(fill='both', expand=True, padx=10, pady=5)
-
-    # Left Column: Numerical Cards (Row 1: HR, Row 2: RR, Row 3: Temp)
-    left_col = tk.Frame(main_frame, bg='#0d1117', width=260)
-    left_col.pack(side='left', fill='y', padx=(0, 5))
-    left_col.pack_propagate(False)
-
-    self.card_hr = self._create_vital_card(
-        left_col, '1. HEART RATE (rPPG)', '#3fb950', 'BPM'
-    )
-    self.card_rr = self._create_vital_card(
-        left_col, '2. RESPIRATION RATE', '#58a6ff', 'BrPM'
-    )
-    self.card_temp = self._create_vital_card(
-        left_col, '3. SKIN TEMPERATURE', '#f85149', '°C'
-    )
-
-    # Right Column: Waveform Graphs (Row 1: PPG, Row 2: Resp, Row 3: Temp/Status)
-    right_col = tk.Frame(main_frame, bg='#0d1117')
-    right_col.pack(side='right', fill='both', expand=True, padx=(5, 0))
-
-    self.wave_ppg = self._create_graph_card(
-        right_col, '1. REAL-TIME BVP / PPG WAVEFORM', '#3fb950'
-    )
-    self.wave_resp = self._create_graph_card(
-        right_col, '2. RESPIRATION WAVEFORM (PRV)', '#58a6ff'
-    )
-
-    # Row 3: Anomaly & Temperature Status Box
-    temp_graph_frame = tk.Frame(right_col, bg='#161b22')
-    temp_graph_frame.pack(fill='both', expand=True, pady=4)
-
-    lbl_t = tk.Label(
-        temp_graph_frame,
-        text='3. TEMPERATURE & ANOMALY STATUS',
-        font=('Helvetica', 9, 'bold'),
-        fg='#8b949e',
-        bg='#161b22',
-    )
-    lbl_t.pack(anchor='nw', padx=10, pady=(6, 2))
-
-    self.wave_temp = SweepWaveformCanvas(
-        temp_graph_frame, color='#f85149', speed=1.5
-    )
-    self.wave_temp.pack(fill='both', expand=True, padx=5, pady=(0, 2))
-
-    self.lbl_anomaly = tk.Label(
-        temp_graph_frame,
-        text='SYSTEM INITIALIZING...',
-        font=('Helvetica', 10, 'bold'),
-        fg='#3fb950',
-        bg='#161b22',
-        anchor='w',
-        padx=10,
-    )
-    self.lbl_anomaly.pack(fill='x', side='bottom', pady=4)
-
-  def _create_vital_card(self, parent, title, color, unit):
-    frame = tk.Frame(parent, bg='#161b22', highlightthickness=1)
-    frame.config(highlightbackground='#21262d')
-    frame.pack(fill='x', expand=True, pady=4)
-
-    bar = tk.Frame(frame, bg=color, width=4)
-    bar.pack(side='left', fill='y')
-
-    inner = tk.Frame(frame, bg='#161b22')
-    inner.pack(fill='both', expand=True, padx=10, pady=8)
-
-    lbl_title = tk.Label(
-        inner,
-        text=title,
-        font=('Helvetica', 9, 'bold'),
-        fg='#8b949e',
-        bg='#161b22',
-    )
-    lbl_title.pack(anchor='w')
-
-    val_frame = tk.Frame(inner, bg='#161b22')
-    val_frame.pack(fill='x', pady=4)
-
-    lbl_val = tk.Label(
-        val_frame,
-        text='--',
-        font=('Courier', 36, 'bold'),
-        fg=color,
-        bg='#161b22',
-    )
-    lbl_val.pack(side='left')
-
-    lbl_unit = tk.Label(
-        val_frame,
-        text=unit,
-        font=('Helvetica', 11, 'bold'),
-        fg='#8b949e',
-        bg='#161b22',
-    )
-    lbl_unit.pack(side='right', anchor='s', pady=6)
-
-    lbl_sqi = tk.Label(
-        inner,
-        text='SQI: 0.00',
-        font=('Helvetica', 8),
-        fg='#8b949e',
-        bg='#161b22',
-    )
-    lbl_sqi.pack(anchor='w')
-
-    return {'val': lbl_val, 'sqi': lbl_sqi}
-
-  def _create_graph_card(self, parent, title, color):
-    frame = tk.Frame(parent, bg='#161b22')
-    frame.pack(fill='both', expand=True, pady=4)
-
-    lbl = tk.Label(
-        frame,
-        text=title,
-        font=('Helvetica', 9, 'bold'),
-        fg='#8b949e',
-        bg='#161b22',
-    )
-    lbl.pack(anchor='nw', padx=10, pady=(6, 2))
-
-    canvas = SweepWaveformCanvas(frame, color=color, speed=2.2)
-    canvas.pack(fill='both', expand=True, padx=5, pady=(0, 5))
-    return canvas
-
-  def add_real_bvp_sample(self, bvp_norm, resp_norm=0.0):
-    """실제 센서 파형 각 위치별 그리기"""
-    self.wave_ppg.add_sample(bvp_norm)  # Row 1: PPG 심박 파형
-    self.wave_resp.add_sample(resp_norm)  # Row 2: 호흡 파형
-    self.wave_temp.add_sample(0.0)  # Row 3: 온도 박스 (가짜 파형 제거)
-
-  def update_data(self, data):
-    """수치 및 상태 업데이트"""
-    if data.get('hr_bpm') is not None:
-      bpm = data['hr_bpm']
-      conf = data.get('hr_conf', 0.0)
-      self.card_hr['val'].config(
-          text=f'{int(bpm)}' if conf > 0.3 else '--'
-      )
-      self.card_hr['sqi'].config(text=f'SQI: {conf:.2f}')
-
-    if data.get('rr_bpm') is not None:
-      rr = data['rr_bpm']
-      conf = data.get('rr_conf', 0.0)
-      self.card_rr['val'].config(
-          text=f'{int(rr)}' if conf > 0.3 else '--'
-      )
-      self.card_rr['sqi'].config(text=f'SQI: {conf:.2f}')
-
-    # 적외선 카메라 미연결 시 -- 표시
-    temp_val = data.get('temp')
-    if temp_val is not None:
-      self.card_temp['val'].config(text=f'{temp_val:.1f}')
-    else:
-      self.card_temp['val'].config(text='--')
-
-    if data.get('face_visible'):
-      self.lbl_face.config(text='● Face Detected', fg='#3fb950')
-    else:
-      self.lbl_face.config(text='● No Face', fg='#d29922')
-
-    self.lbl_fps.config(text=f"{int(data.get('fps', 0))} FPS")
-
-    a = data.get('anomaly')
-    if a:
-      if a.get('critical'):
-        self.lbl_anomaly.config(
-            text=f"CRITICAL: {a['critical']}", fg='#f85149'
-        )
-      elif a.get('state') == 'signal_lost':
-        self.lbl_anomaly.config(
-            text='SIGNAL LOST - Hold position', fg='#d29922'
-        )
-      elif a.get('alert'):
-        self.lbl_anomaly.config(
-            text=f"ANOMALY: {a.get('alert_reason')}", fg='#f85149'
-        )
-      elif a.get('baseline') is None:
-        prog = int((a.get('progress') or 0) * 100)
-        self.lbl_anomaly.config(
-            text=f'LEARNING BASELINE ({prog}%)', fg='#d29922'
-        )
-      else:
-        self.lbl_anomaly.config(text='NORMAL VITAL SIGNS', fg='#3fb950')
-
-
-# ══════════════════════════════════════════════════════
-#  open-rppg 바이탈 트래커 + 안면 Green 채널 rPPG 추출
-# ══════════════════════════════════════════════════════
-class OpenRppgVitalTracker:
-
-  def __init__(self, model):
-    self.model = model
-    self.hr_bpm = 0.0
-    self.hr_conf = 0.0
-    self.rr_bpm = 0.0
-    self.rr_conf = 0.0
-
-  def update(self, face_visible):
-    if not face_visible:
-      self.hr_conf = 0.0
-      self.rr_conf = 0.0
-      return
-
-    res_hr = self.model.hr(start=-10, return_hrv=False) or {}
-    hr = float(res_hr.get('hr') or 0)
-    sqi_hr = float(res_hr.get('SQI') or 0)
-    if 40 <= hr <= 200:
-      self.hr_bpm = hr
-      self.hr_conf = min(1.0, max(0.0, sqi_hr))
-
-    res_rr = self.model.hr(start=-60) or {}
-    hrv = res_rr.get('hrv') or {}
-    rr_hz = float(hrv.get('breathingrate') or 0)
-    rr = rr_hz * 60.0
-    sqi_rr = float(res_rr.get('SQI') or 0)
-    if 4 <= rr <= 40:
-      self.rr_bpm = rr
-      self.rr_conf = min(1.0, max(0.0, sqi_rr))
-
-
-def start_rppg_thread(app, camera_id=0, calib_sec=180.0):
-  model = rppg.Model('ME-flow.rlap')
-  tracker = OpenRppgVitalTracker(model)
-  detector = VitalAnomalyDetector(calib_sec=calib_sec)
-
-  normalizer_bvp = SignalNormalizer(window_size=90)
-
-  last_hr_time = time.time()
-  fps_timer = time.time()
-  frames = 0
-  fps = 0.0
-
-  with model.video_capture(camera_id):
-    for frame_rgb, box in model.preview:
-      now = time.time()
-      face_visible = box is not None
-      frames += 1
-
-      # --------------------------------------------------
-      # 안면 ROI Green 채널 신호 직접 추출 (실시간 PPG 파형)
-      # --------------------------------------------------
-      raw_bvp_val = 0.0
-      if face_visible and box is not None:
-        try:
-          (y1, y2), (x1, x2) = box[0], box[1]
-          h, w, _ = frame_rgb.shape
-          y1, y2 = max(0, int(y1)), min(h, int(y2))
-          x1, x2 = max(0, int(x1)), min(w, int(x2))
-
-          if y2 > y1 and x2 > x1:
-            # 얼굴 중앙 영역 추출 (이마/볼 영역 중심)
-            roi_y1 = y1 + int((y2 - y1) * 0.2)
-            roi_y2 = y1 + int((y2 - y1) * 0.6)
-            roi_x1 = x1 + int((x2 - x1) * 0.25)
-            roi_x2 = x1 + int((x2 - x1) * 0.75)
-
-            face_roi = frame_rgb[roi_y1:roi_y2, roi_x1:roi_x2]
-            if face_roi.size > 0:
-              raw_bvp_val = float(np.mean(face_roi[:, :, 1]))  # Green Channel
-        except Exception:
-          raw_bvp_val = 0.0
-
-      if face_visible and raw_bvp_val > 0:
-        norm_bvp = normalizer_bvp.normalize(raw_bvp_val)
-        # 실제 추정된 호흡 주기에 맞춘 호흡 파형 생성
-        rr_bpm_active = tracker.rr_bpm if tracker.rr_bpm > 0 else 18.0
-        norm_resp = math.sin(now * (rr_bpm_active / 60.0) * 2 * math.pi)
-      else:
-        norm_bvp = 0.0
-        norm_resp = 0.0
-
-      # 실시간 파형 그리기
-      app.after(0, app.add_real_bvp_sample, norm_bvp, norm_resp)
-
-      # --------------------------------------------------
-      # FPS 및 2초 주기 바이탈 측정
-      # --------------------------------------------------
-      if now - fps_timer >= 2.0:
-        fps = frames / (now - fps_timer)
-        frames = 0
-        fps_timer = now
-
-      if now - last_hr_time >= 2.0:
-        tracker.update(face_visible)
-        anomaly = detector.push(
-            tracker.hr_bpm, tracker.hr_conf, tracker.rr_bpm, tracker.rr_conf
-        )
-        last_hr_time = now
-
-        payload = {
-            'face_visible': face_visible,
-            'fps': fps,
-            'hr_bpm': tracker.hr_bpm,
-            'hr_conf': tracker.hr_conf,
-            'rr_bpm': tracker.rr_bpm,
-            'rr_conf': tracker.rr_conf,
-            'temp': None,  # 적외선 카메라 미연결 상태
-            'anomaly': anomaly,
+class VitalWorker(threading.Thread):
+    """카메라와 open-rppg를 담당하고 최신 상태를 스냅샷으로 노출한다."""
+
+    PPG_WINDOW_SEC = 6.0
+    RESP_WINDOW_SEC = 30.0
+
+    HR_INTERVAL = 2.0
+    RR_INTERVAL = 10.0
+    WAVE_INTERVAL = 0.25
+
+    def __init__(self, camera_id=0):
+        super().__init__(daemon=True)
+        self.camera_id = camera_id
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._snapshot = {
+            "status": "모델 로딩 중...",
+            "face": False,
+            "hr": 0.0,
+            "hr_conf": 0.0,
+            "rr": 0.0,
+            "rr_conf": 0.0,
+            "ppg": None,
+            "resp": None,
         }
-        app.after(0, app.update_data, payload)
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._snapshot)
+
+    def stop(self):
+        self._stop.set()
+
+    def _publish(self, **kwargs):
+        with self._lock:
+            self._snapshot.update(kwargs)
+
+    # ── 파형 추출 ──────────────────────────────────────
+
+    @staticmethod
+    def _normalize(signal, max_points=320):
+        """파형을 0~1로 정규화하고 그리기 좋게 다운샘플한다."""
+        x = np.asarray(signal, dtype=float)
+        x = x[np.isfinite(x)]
+
+        if x.size < 16:
+            return None
+
+        if x.size > max_points:
+            idx = np.linspace(0, x.size - 1, max_points).astype(int)
+            x = x[idx]
+
+        lo, hi = float(x.min()), float(x.max())
+
+        if hi - lo < 1e-9:
+            return None
+
+        return ((x - lo) / (hi - lo)).tolist()
+
+    def _ppg_wave(self, model):
+        try:
+            bvp, _ts = model.bvp(start=-self.PPG_WINDOW_SEC)
+        except Exception:
+            return None
+
+        return self._normalize(bvp)
+
+    def _resp_wave(self, model):
+        """raw BVP를 0.1~0.5Hz로 대역통과해 호흡성 변동을 뽑는다."""
+        try:
+            bvp, ts = model.bvp(raw=True, start=-self.RESP_WINDOW_SEC)
+        except Exception:
+            return None
+
+        bvp = np.asarray(bvp, dtype=float)
+        ts = np.asarray(ts, dtype=float)
+
+        if bvp.size < 64 or ts.size != bvp.size:
+            return None
+
+        span = ts[-1] - ts[0]
+
+        if span <= 0:
+            return None
+
+        fs = (ts.size - 1) / span
+
+        if not 5.0 <= fs <= 120.0:
+            return None
+
+        nyq = fs / 2.0
+        b, a = butter(2, [0.1 / nyq, 0.5 / nyq], btype="band")
+
+        try:
+            filtered = filtfilt(b, a, bvp)
+        except ValueError:
+            return None
+
+        return self._normalize(filtered)
+
+    # ── 메인 루프 ──────────────────────────────────────
+
+    def run(self):
+        try:
+            model = rppg.Model("ME-flow.rlap")
+        except Exception as exc:
+            self._publish(status=f"모델 로딩 실패: {exc}")
+            return
+
+        vitals = OpenRppgVitalTracker(model)
+        self._publish(status="카메라 연결 중...")
+
+        last_hr = last_rr = last_wave = 0.0
+
+        try:
+            with model.video_capture(self.camera_id):
+                self._publish(status="측정 중")
+
+                for _frame, box in model.preview:
+                    if self._stop.is_set():
+                        break
+
+                    now = time.time()
+                    face_visible = box is not None
+
+                    if not face_visible:
+                        vitals.invalidate()
+
+                    if now - last_rr >= self.RR_INTERVAL:
+                        vitals.update_rr(face_visible)
+                        last_rr = now
+
+                    if now - last_hr >= self.HR_INTERVAL:
+                        vitals.update_hr(face_visible)
+                        last_hr = now
+
+                    if now - last_wave >= self.WAVE_INTERVAL:
+                        last_wave = now
+
+                        self._publish(
+                            face=face_visible,
+                            hr=vitals.hr_bpm,
+                            hr_conf=vitals.hr_conf,
+                            rr=vitals.rr_bpm,
+                            rr_conf=vitals.rr_conf,
+                            ppg=self._ppg_wave(model),
+                            resp=self._resp_wave(model),
+                            status=(
+                                "측정 중"
+                                if face_visible
+                                else "얼굴을 찾는 중"
+                            ),
+                        )
+
+        except Exception as exc:
+            self._publish(status=f"측정 중단: {exc}")
 
 
 # ══════════════════════════════════════════════════════
-#  Main Execution
+#  위젯
 # ══════════════════════════════════════════════════════
-if __name__ == '__main__':
-  parser = argparse.ArgumentParser()
-  parser.add_argument('--camera', type=int, default=0)
-  args, _ = parser.parse_known_args()
 
-  app = BioGuardianTkApp()
+class ValueCard(tk.Frame):
+    """왼쪽 열의 수치 카드."""
 
-  t = threading.Thread(
-      target=start_rppg_thread, args=(app, args.camera), daemon=True
-  )
-  t.start()
+    def __init__(self, parent, title, unit, color, bg):
+        super().__init__(parent, bg=bg, padx=8, pady=10)
 
-  app.mainloop()
+        self.color = color
+
+        tk.Label(
+            self,
+            text=title,
+            fg=FG_LABEL,
+            bg=bg,
+            font=("Helvetica", 13),
+        ).pack()
+
+        self._value = tk.Label(
+            self,
+            text="--",
+            fg=FG_DIM,
+            bg=bg,
+            font=("Helvetica", 38, "bold"),
+        )
+        self._value.pack()
+
+        tk.Label(
+            self,
+            text=unit,
+            fg=FG_LABEL,
+            bg=bg,
+            font=("Helvetica", 12),
+        ).pack()
+
+    def set_value(self, text, active=True):
+        self._value.configure(
+            text=text,
+            fg=self.color if active else FG_DIM,
+        )
+
+
+class WavePanel(tk.Frame):
+    """오른쪽 열의 파형 패널."""
+
+    def __init__(self, parent, title, color, placeholder="신호 대기 중"):
+        super().__init__(parent, bg=PANEL, padx=10, pady=8)
+
+        self.color = color
+        self.placeholder = placeholder
+
+        header = tk.Frame(self, bg=PANEL)
+        header.pack(fill="x")
+
+        tk.Label(
+            header,
+            text=title,
+            fg=FG_LABEL,
+            bg=PANEL,
+            font=("Helvetica", 12),
+        ).pack(side="left")
+
+        self._dot = tk.Label(
+            header,
+            text="\u25cf",
+            fg=FG_DIM,
+            bg=PANEL,
+            font=("Helvetica", 12),
+        )
+        self._dot.pack(side="right")
+
+        self.canvas = tk.Canvas(
+            self,
+            bg=PANEL,
+            height=100,
+            highlightthickness=0,
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+    def set_active(self, active):
+        self._dot.configure(fg=self.color if active else FG_DIM)
+
+    def draw(self, values):
+        self.canvas.delete("wave")
+
+        width = self.canvas.winfo_width()
+        height = self.canvas.winfo_height()
+
+        if width < 20 or height < 20:
+            return
+
+        if not values or len(values) < 2:
+            self.canvas.create_text(
+                width / 2,
+                height / 2,
+                text=self.placeholder,
+                fill=FG_DIM,
+                font=("Helvetica", 11),
+                tags="wave",
+            )
+            return
+
+        pad = 8
+        span_x = width - 2 * pad
+        span_y = height - 2 * pad
+        last = len(values) - 1
+
+        points = []
+
+        for i, value in enumerate(values):
+            points.append(pad + span_x * i / last)
+            points.append(height - pad - span_y * value)
+
+        self.canvas.create_line(
+            *points,
+            fill=self.color,
+            width=2,
+            tags="wave",
+        )
+
+
+# ══════════════════════════════════════════════════════
+#  대시보드
+# ══════════════════════════════════════════════════════
+
+class Dashboard:
+    MIN_CONF = 0.3
+    REFRESH_MS = 150
+
+    def __init__(self, root, worker):
+        self.root = root
+        self.worker = worker
+
+        root.title("Bio-Guardian Patient Monitor")
+        root.geometry("900x580")
+        root.configure(bg=BG)
+
+        tk.Label(
+            root,
+            text="Bio-Guardian Patient Monitor",
+            fg="#a8c7fa",
+            bg=BG,
+            font=("Helvetica", 16, "bold"),
+            anchor="w",
+            padx=12,
+            pady=8,
+        ).grid(row=0, column=0, columnspan=2, sticky="ew")
+
+        root.grid_columnconfigure(0, weight=0, minsize=200)
+        root.grid_columnconfigure(1, weight=1)
+
+        for row in (1, 2, 3):
+            root.grid_rowconfigure(row, weight=1)
+
+        self.hr_card = ValueCard(root, "Heart Rate", "BPM", HR_COLOR, CARD_HR)
+        self.rr_card = ValueCard(root, "Respiration", "RR", RR_COLOR, CARD_RR)
+        self.temp_card = ValueCard(
+            root, "Temperature", "\u00b0C", TEMP_COLOR, CARD_TEMP
+        )
+
+        self.ppg_panel = WavePanel(root, "PPG Wave", HR_COLOR)
+        self.resp_panel = WavePanel(root, "Respiration Wave", RR_COLOR)
+        self.temp_panel = WavePanel(
+            root, "Temperature Trend", TEMP_COLOR, placeholder="NO SENSOR"
+        )
+
+        cards = (self.hr_card, self.rr_card, self.temp_card)
+        panels = (self.ppg_panel, self.resp_panel, self.temp_panel)
+
+        for row, (card, panel) in enumerate(zip(cards, panels), start=1):
+            card.grid(row=row, column=0, sticky="nsew", padx=(8, 4), pady=4)
+            panel.grid(row=row, column=1, sticky="nsew", padx=(4, 8), pady=4)
+
+        self.temp_card.set_value("N/A", active=False)
+
+        self.status = tk.Label(
+            root,
+            text="",
+            fg=FG_DIM,
+            bg=BG,
+            font=("Helvetica", 10),
+            anchor="w",
+            padx=12,
+            pady=4,
+        )
+        self.status.grid(row=4, column=0, columnspan=2, sticky="ew")
+
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.refresh()
+
+    def refresh(self):
+        snap = self.worker.snapshot()
+
+        hr_ok = snap["hr_conf"] >= self.MIN_CONF
+        rr_ok = snap["rr_conf"] >= self.MIN_CONF
+
+        self.hr_card.set_value(
+            f"{snap['hr']:.0f}" if hr_ok else "--", active=hr_ok
+        )
+        self.rr_card.set_value(
+            f"{snap['rr']:.0f}" if rr_ok else "--", active=rr_ok
+        )
+
+        self.ppg_panel.set_active(hr_ok)
+        self.resp_panel.set_active(rr_ok)
+
+        self.ppg_panel.draw(snap["ppg"])
+        self.resp_panel.draw(snap["resp"])
+        self.temp_panel.draw(None)
+
+        self.status.configure(
+            text=(
+                f"{snap['status']}   "
+                f"SQI  HR {snap['hr_conf']:.2f} / RR {snap['rr_conf']:.2f}"
+            )
+        )
+
+        self.root.after(self.REFRESH_MS, self.refresh)
+
+    def close(self):
+        self.worker.stop()
+        self.root.destroy()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="환자 모니터 대시보드")
+    parser.add_argument("--camera", type=int, default=0, help="카메라 ID")
+    args = parser.parse_args()
+
+    worker = VitalWorker(camera_id=args.camera)
+    worker.start()
+
+    root = tk.Tk()
+    Dashboard(root, worker)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
