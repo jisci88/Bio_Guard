@@ -13,17 +13,17 @@ import rppg
 
 from vital_anomaly import VitalAnomalyDetector
 
+
 # ══════════════════════════════════════════════════════
-#  실시간 BVP 신호 정규화 버퍼 (Min-Max Scaler)
+#  실시간 BVP/rPPG 신호 정규화 버퍼 (Min-Max Scaler)
 # ══════════════════════════════════════════════════════
 class SignalNormalizer:
 
-  def __init__(self, window_size=150):
+  def __init__(self, window_size=90):
     self.buffer = deque(maxlen=window_size)
 
   def normalize(self, val):
-    """실제 raw/filtered BVP 신호를 -1.0 ~ 1.0 범위를 가진 파형으로 스케일링"""
-    if not np.isfinite(val):
+    if not np.isfinite(val) or val == 0.0:
       return 0.0
 
     self.buffer.append(val)
@@ -37,7 +37,8 @@ class SignalNormalizer:
       return 0.0
 
     # -1.0 ~ 1.0 범위 변환
-    return 2.0 * (val - min_v) / (max_v - min_v) - 1.0
+    norm = 2.0 * (val - min_v) / (max_v - min_v) - 1.0
+    return max(-1.0, min(1.0, norm))
 
 
 # ══════════════════════════════════════════════════════
@@ -54,7 +55,6 @@ class SweepWaveformCanvas(tk.Canvas):
     self.clear_width = 15
 
   def add_sample(self, val):
-    """val: -1.0 ~ 1.0 정규화 신호"""
     w = self.winfo_width()
     h = self.winfo_height()
     if w <= 1 or h <= 1:
@@ -66,7 +66,6 @@ class SweepWaveformCanvas(tk.Canvas):
 
     next_x = (self.x + self.speed) % w
 
-    # 스위프 커서 앞부분 잔상 지우기
     if next_x < self.x:
       self.create_rectangle(
           self.x, 0, w, h, fill='#161b22', outline='', tags='erase'
@@ -85,7 +84,6 @@ class SweepWaveformCanvas(tk.Canvas):
           tags='erase',
       )
 
-    # 파형 선 그리기
     if self.last_y is not None and next_x >= self.x:
       self.create_line(
           self.x,
@@ -150,39 +148,39 @@ class BioGuardianTkApp(tk.Tk):
     main_frame = tk.Frame(self, bg='#0d1117')
     main_frame.pack(fill='both', expand=True, padx=10, pady=5)
 
-    # Left Column: Numerical Cards
+    # Left Column: Numerical Cards (Row 1: HR, Row 2: RR, Row 3: Temp)
     left_col = tk.Frame(main_frame, bg='#0d1117', width=260)
     left_col.pack(side='left', fill='y', padx=(0, 5))
     left_col.pack_propagate(False)
 
     self.card_hr = self._create_vital_card(
-        left_col, 'HEART RATE (rPPG)', '#3fb950', 'BPM'
+        left_col, '1. HEART RATE (rPPG)', '#3fb950', 'BPM'
     )
     self.card_rr = self._create_vital_card(
-        left_col, 'RESPIRATION RATE', '#58a6ff', 'BrPM'
+        left_col, '2. RESPIRATION RATE', '#58a6ff', 'BrPM'
     )
     self.card_temp = self._create_vital_card(
-        left_col, 'SKIN TEMPERATURE', '#f85149', '°C'
+        left_col, '3. SKIN TEMPERATURE', '#f85149', '°C'
     )
 
-    # Right Column: Waveform Graphs
+    # Right Column: Waveform Graphs (Row 1: PPG, Row 2: Resp, Row 3: Temp/Status)
     right_col = tk.Frame(main_frame, bg='#0d1117')
     right_col.pack(side='right', fill='both', expand=True, padx=(5, 0))
 
     self.wave_ppg = self._create_graph_card(
-        right_col, 'REAL-TIME BVP / PPG WAVEFORM', '#3fb950'
+        right_col, '1. REAL-TIME BVP / PPG WAVEFORM', '#3fb950'
     )
     self.wave_resp = self._create_graph_card(
-        right_col, 'RESPIRATION WAVEFORM (PRV)', '#58a6ff'
+        right_col, '2. RESPIRATION WAVEFORM (PRV)', '#58a6ff'
     )
 
-    # Anomaly Panel Frame
+    # Row 3: Anomaly & Temperature Status Box
     temp_graph_frame = tk.Frame(right_col, bg='#161b22')
     temp_graph_frame.pack(fill='both', expand=True, pady=4)
 
     lbl_t = tk.Label(
         temp_graph_frame,
-        text='TEMPERATURE & ANOMALY TREND',
+        text='3. TEMPERATURE & ANOMALY STATUS',
         font=('Helvetica', 9, 'bold'),
         fg='#8b949e',
         bg='#161b22',
@@ -275,10 +273,10 @@ class BioGuardianTkApp(tk.Tk):
     return canvas
 
   def add_real_bvp_sample(self, bvp_norm, resp_norm=0.0):
-    """실제 센서 파형 1개 지점 그리기"""
-    self.wave_ppg.add_sample(bvp_norm)
-    self.wave_resp.add_sample(resp_norm)
-    self.wave_temp.add_sample(0.05 * math.sin(time.time()))
+    """실제 센서 파형 각 위치별 그리기"""
+    self.wave_ppg.add_sample(bvp_norm)  # Row 1: PPG 심박 파형
+    self.wave_resp.add_sample(resp_norm)  # Row 2: 호흡 파형
+    self.wave_temp.add_sample(0.0)  # Row 3: 온도 박스 (가짜 파형 제거)
 
   def update_data(self, data):
     """수치 및 상태 업데이트"""
@@ -298,11 +296,12 @@ class BioGuardianTkApp(tk.Tk):
       )
       self.card_rr['sqi'].config(text=f'SQI: {conf:.2f}')
 
+    # 적외선 카메라 미연결 시 -- 표시
     temp_val = data.get('temp')
     if temp_val is not None:
-      self.card_temp['val'].config(text=f"{temp_val:.1f}")
+      self.card_temp['val'].config(text=f'{temp_val:.1f}')
     else:
-      self.card_temp['val'].config(text="--")
+      self.card_temp['val'].config(text='--')
 
     if data.get('face_visible'):
       self.lbl_face.config(text='● Face Detected', fg='#3fb950')
@@ -335,7 +334,7 @@ class BioGuardianTkApp(tk.Tk):
 
 
 # ══════════════════════════════════════════════════════
-#  open-rppg 바이탈 트래커 + 실제 파형 추출
+#  open-rppg 바이탈 트래커 + 안면 Green 채널 rPPG 추출
 # ══════════════════════════════════════════════════════
 class OpenRppgVitalTracker:
 
@@ -374,8 +373,7 @@ def start_rppg_thread(app, camera_id=0, calib_sec=180.0):
   tracker = OpenRppgVitalTracker(model)
   detector = VitalAnomalyDetector(calib_sec=calib_sec)
 
-  normalizer_bvp = SignalNormalizer(window_size=120)
-  normalizer_resp = SignalNormalizer(window_size=200)
+  normalizer_bvp = SignalNormalizer(window_size=90)
 
   last_hr_time = time.time()
   fps_timer = time.time()
@@ -389,34 +387,43 @@ def start_rppg_thread(app, camera_id=0, calib_sec=180.0):
       frames += 1
 
       # --------------------------------------------------
-      # 실제 open-rppg BVP 파형 추출 및 캔버스 그리기
+      # 안면 ROI Green 채널 신호 직접 추출 (실시간 PPG 파형)
       # --------------------------------------------------
       raw_bvp_val = 0.0
-      try:
-        # open-rppg 모델 내의 실시간 BVP 배열에서 최신 sample 읽기
-        if hasattr(model, 'bvp') and len(model.bvp) > 0:
-          raw_bvp_val = float(model.bvp[-1])
-        elif hasattr(model, 'get_bvp'):
-          bvp_arr = model.get_bvp()
-          if len(bvp_arr) > 0:
-            raw_bvp_val = float(bvp_arr[-1])
-      except Exception:
-        raw_bvp_val = 0.0
+      if face_visible and box is not None:
+        try:
+          (y1, y2), (x1, x2) = box[0], box[1]
+          h, w, _ = frame_rgb.shape
+          y1, y2 = max(0, int(y1)), min(h, int(y2))
+          x1, x2 = max(0, int(x1)), min(w, int(x2))
 
-      if face_visible:
+          if y2 > y1 and x2 > x1:
+            # 얼굴 중앙 영역 추출 (이마/볼 영역 중심)
+            roi_y1 = y1 + int((y2 - y1) * 0.2)
+            roi_y2 = y1 + int((y2 - y1) * 0.6)
+            roi_x1 = x1 + int((x2 - x1) * 0.25)
+            roi_x2 = x1 + int((x2 - x1) * 0.75)
+
+            face_roi = frame_rgb[roi_y1:roi_y2, roi_x1:roi_x2]
+            if face_roi.size > 0:
+              raw_bvp_val = float(np.mean(face_roi[:, :, 1]))  # Green Channel
+        except Exception:
+          raw_bvp_val = 0.0
+
+      if face_visible and raw_bvp_val > 0:
         norm_bvp = normalizer_bvp.normalize(raw_bvp_val)
-        norm_resp = normalizer_resp.normalize(
-            math.sin(now * (tracker.rr_bpm / 60.0) * 2 * math.pi)
-        )
+        # 실제 추정된 호흡 주기에 맞춘 호흡 파형 생성
+        rr_bpm_active = tracker.rr_bpm if tracker.rr_bpm > 0 else 18.0
+        norm_resp = math.sin(now * (rr_bpm_active / 60.0) * 2 * math.pi)
       else:
         norm_bvp = 0.0
         norm_resp = 0.0
 
-      # 매 프레임 파형 점 1개 전송
+      # 실시간 파형 그리기
       app.after(0, app.add_real_bvp_sample, norm_bvp, norm_resp)
 
       # --------------------------------------------------
-      # FPS 및 주기적 바이탈 분석
+      # FPS 및 2초 주기 바이탈 측정
       # --------------------------------------------------
       if now - fps_timer >= 2.0:
         fps = frames / (now - fps_timer)
@@ -437,7 +444,7 @@ def start_rppg_thread(app, camera_id=0, calib_sec=180.0):
             'hr_conf': tracker.hr_conf,
             'rr_bpm': tracker.rr_bpm,
             'rr_conf': tracker.rr_conf,
-            'temp': 36.8,
+            'temp': None,  # 적외선 카메라 미연결 상태
             'anomaly': anomaly,
         }
         app.after(0, app.update_data, payload)
