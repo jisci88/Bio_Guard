@@ -13,7 +13,6 @@ import rppg
 
 from vital_anomaly import VitalAnomalyDetector
 
-
 # ══════════════════════════════════════════════════════
 #  실시간 BVP 신호 정규화 버퍼 (Min-Max Scaler)
 # ══════════════════════════════════════════════════════
@@ -299,7 +298,11 @@ class BioGuardianTkApp(tk.Tk):
       )
       self.card_rr['sqi'].config(text=f'SQI: {conf:.2f}')
 
-    self.card_temp['val'].config(text=f"{data.get('temp', 36.8):.1f}")
+    temp_val = data.get('temp')
+    if temp_val is not None:
+      self.card_temp['val'].config(text=f"{temp_val:.1f}")
+    else:
+      self.card_temp['val'].config(text="--")
 
     if data.get('face_visible'):
       self.lbl_face.config(text='● Face Detected', fg='#3fb950')
