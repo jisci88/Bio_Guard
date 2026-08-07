@@ -13,13 +13,13 @@
   rppg.Model("ME-flow.rlap")은 pickle로 저장할 수 없다.
 
 설치:
-    pip install open-rppg opencv-python numpy scikit-learn
+    pip install open-rppg "opencv-python<5" numpy scikit-learn "setuptools<81"
 
 실행:
     # 라즈베리파이 데스크톱
     python vital_monitor.py --camera 0
 
-    # SSH 또는 VS Code Remote
+    # SSH 또는 VS Code Remote 
     python vital_monitor.py --camera 0 --headless
 """
 
