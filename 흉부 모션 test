@@ -1,0 +1,540 @@
+"""
+실시간 심박수 + 호흡수 측정 + 환자별 개인화 이상 탐지
+
+  심박수  : open-rppg (BVP 주파수 분석)
+  호흡수  : 흉부/어깨 모션 주파수 분석 (scipy Bandpass + FFT)
+  이상탐지: Isolation Forest (환자별 기준 분포 학습) → vital_anomaly.py
+
+설치:
+    pip install open-rppg "opencv-python<5" numpy scipy scikit-learn "setuptools<81"
+
+실행:
+    # 라즈베리파이 데스크톱
+    python vital_monitor.py --camera 0
+
+    # SSH 또는 헤드리스 모드
+    python vital_monitor.py --camera 0 --headless
+"""
+
+import argparse
+import collections
+import os
+import time
+
+import cv2
+import numpy as np
+import rppg
+from scipy.signal import butter, filtfilt
+
+from vital_anomaly import VitalAnomalyDetector
+
+
+def should_show_window(headless, environ=None):
+    """X11 디스플레이가 있고 headless가 아닐 때만 창을 표시한다."""
+    env = os.environ if environ is None else environ
+    return not headless and bool(env.get("DISPLAY"))
+
+
+# ══════════════════════════════════════════════════════
+#  1. 흉부/어깨 모션 기반 호흡수 추적기 (scipy)
+# ══════════════════════════════════════════════════════
+
+class ChestMotionRespirationTracker:
+    """얼굴 박스 하단(흉부/어깨) 영역의 미세 상하 움직임을 추적해 호흡수를 계산합니다."""
+
+    RR_MIN_HZ = 0.10  # 분당 6회
+    RR_MAX_HZ = 0.55  # 분당 33회
+
+    def __init__(self, buffer_sec=25):
+        self.buffer_sec = buffer_sec
+        # 30fps 기준 최대 약 900 프레임 버퍼
+        self.max_frames = int(30 * buffer_sec)
+        self.signal_buffer = collections.deque(maxlen=self.max_frames)
+        self.timestamps = collections.deque(maxlen=self.max_frames)
+
+        self.rr_bpm = 0.0
+        self.rr_conf = 0.0
+        self.chest_box = None
+
+    def invalidate(self):
+        """신호 소실 시 버퍼 및 신뢰도 초기화"""
+        self.signal_buffer.clear()
+        self.timestamps.clear()
+        self.rr_conf = 0.0
+        self.chest_box = None
+
+    def update_frame(self, frame_rgb, face_box, now):
+        """매 프레임 호출되어 흉부 영역의 움직임 신호를 누적합니다."""
+        if face_box is None:
+            self.chest_box = None
+            return
+
+        (y1, y2), (x1, x2) = face_box
+        h, w = frame_rgb.shape[:2]
+        face_h = y2 - y1
+        face_w = x2 - x1
+
+        # 얼굴 하단(목 ~ 흉부 상단) 관심 영역(ROI) 추출
+        chest_y1 = min(h - 1, y2 + int(face_h * 0.15))
+        chest_y2 = min(h, y2 + int(face_h * 1.50))
+        chest_x1 = max(0, x1 - int(face_w * 0.25))
+        chest_x2 = min(w, x2 + int(face_w * 0.25))
+
+        if chest_y2 - chest_y1 < 10 or chest_x2 - chest_x1 < 10:
+            self.chest_box = None
+            return
+
+        self.chest_box = ((chest_y1, chest_y2), (chest_x1, chest_x2))
+        
+        # 흉부 영역의 평균 밝기 변화량(호흡에 따른 미세 팽창/수축 모션) 기록
+        chest_roi = frame_rgb[chest_y1:chest_y2, chest_x1:chest_x2]
+        motion_intensity = float(np.mean(chest_roi))
+
+        self.signal_buffer.append(motion_intensity)
+        self.timestamps.append(now)
+
+    def compute_rr(self):
+        """누적된 버퍼에서 호흡수를 계산합니다."""
+        if len(self.signal_buffer) < 150:  # 최소 약 5~6초 이상의 데이터 필요
+            self.rr_conf = 0.0
+            return self.rr_bpm, self.rr_conf
+
+        duration = self.timestamps[-1] - self.timestamps[0]
+        if duration < 8.0:
+            self.rr_conf = 0.0
+            return self.rr_bpm, self.rr_conf
+
+        # 실제 카메라 프레임레이트 계산
+        fs = len(self.signal_buffer) / duration
+        if fs < 5.0:
+            self.rr_conf = 0.0
+            return self.rr_bpm, self.rr_conf
+
+        sig = np.array(self.signal_buffer)
+        
+        # 1. 선형 추세 제거 (조명/체위 서서히 변하는 drift 제거)
+        sig_detrend = sig - np.polyval(np.polyfit(np.arange(len(sig)), sig, 1), np.arange(len(sig)))
+
+        # 2. 대역통과 필터 (0.10 Hz ~ 0.55 Hz = 분당 6 ~ 33회)
+        nyq = 0.5 * fs
+        low = self.RR_MIN_HZ / nyq
+        high = min(self.RR_MAX_HZ / nyq, 0.99)
+
+        if low >= high or low <= 0:
+            self.rr_conf = 0.0
+            return self.rr_bpm, self.rr_conf
+
+        try:
+            b, a = butter(2, [low, high], btype="band")
+            filtered = filtfilt(b, a, sig_detrend)
+        except Exception:
+            self.rr_conf = 0.0
+            return self.rr_bpm, self.rr_conf
+
+        # 3. FFT 스펙트럼 분석
+        n = len(filtered)
+        freqs = np.fft.rfftfreq(n, d=1.0 / fs)
+        fft_vals = np.abs(np.fft.rfft(filtered))
+
+        # 호흡 대역 내 피크 탐색
+        valid_mask = (freqs >= self.RR_MIN_HZ) & (freqs <= self.RR_MAX_HZ)
+        valid_freqs = freqs[valid_mask]
+        valid_fft = fft_vals[valid_mask]
+
+        if len(valid_freqs) == 0:
+            self.rr_conf = 0.0
+            return self.rr_bpm, self.rr_conf
+
+        peak_idx = np.argmax(valid_fft)
+        best_freq = valid_freqs[peak_idx]
+        peak_power = valid_fft[peak_idx]
+        mean_power = np.mean(valid_fft)
+
+        # 신호 대 잡음비(SNR) 기반 신뢰도 계산
+        snr = peak_power / (mean_power + 1e-6)
+        conf = float(np.clip((snr - 1.4) / 3.0, 0.0, 1.0))
+
+        rr = best_freq * 60.0
+
+        if 6.0 <= rr <= 35.0 and conf >= 0.25:
+            # 부드러운 지수 이동평균 적용
+            if self.rr_bpm > 0:
+                self.rr_bpm = 0.7 * self.rr_bpm + 0.3 * rr
+            else:
+                self.rr_bpm = rr
+            self.rr_conf = conf
+        else:
+            self.rr_conf = 0.0
+
+        return self.rr_bpm, self.rr_conf
+
+
+# ══════════════════════════════════════════════════════
+#  2. open-rppg 심박수 전용 추적기
+# ══════════════════════════════════════════════════════
+
+class OpenRppgVitalTracker:
+    """open-rppg로 심박수(HR)를 갱신합니다."""
+
+    HR_MIN, HR_MAX = 40.0, 200.0
+
+    def __init__(self, model, hr_window_sec=10):
+        self.model = model
+        self.hr_window_sec = hr_window_sec
+        self.hr_bpm = 0.0
+        self.hr_conf = 0.0
+
+    @staticmethod
+    def _finite_float(value, default=0.0):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        return value if np.isfinite(value) else default
+
+    def invalidate(self):
+        self.hr_conf = 0.0
+
+    def update_hr(self, face_visible):
+        """심박수를 갱신한다."""
+        if not face_visible:
+            self.hr_conf = 0.0
+            return
+
+        result = self.model.hr(
+            start=-self.hr_window_sec,
+            return_hrv=False,
+        )
+
+        hr = self._finite_float((result or {}).get("hr"))
+        sqi = self._finite_float((result or {}).get("SQI"))
+
+        if self.HR_MIN <= hr <= self.HR_MAX:
+            self.hr_bpm = hr
+            self.hr_conf = float(np.clip(sqi, 0.0, 1.0))
+        else:
+            self.hr_conf = 0.0
+
+
+# ══════════════════════════════════════════════════════
+#  3. HUD 화면 표시
+# ══════════════════════════════════════════════════════
+
+def draw_hud(frame, hr, rr, fps, anomaly):
+    """hr/rr = (값, 신뢰도)."""
+    h, w = frame.shape[:2]
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (0, 0),
+        (355, 225),
+        (10, 10, 10),
+        -1,
+    )
+    cv2.addWeighted(
+        overlay,
+        0.55,
+        frame,
+        0.45,
+        0,
+        frame,
+    )
+
+    def block(label, value, conf, unit, y, hue):
+        col = hue if conf > 0.25 else (130, 130, 130)
+
+        cv2.putText(
+            frame,
+            label,
+            (10, y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            col,
+            1,
+        )
+
+        text = (
+            f"{value:.0f} {unit}"
+            if conf > 0.25
+            else "warming up..."
+        )
+
+        cv2.putText(
+            frame,
+            text,
+            (10, y + 34),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.25,
+            col,
+            2,
+        )
+
+        cv2.rectangle(
+            frame,
+            (10, y + 44),
+            (100, y + 52),
+            (50, 50, 50),
+            -1,
+        )
+
+        cv2.rectangle(
+            frame,
+            (10, y + 44),
+            (10 + int(min(conf, 1.0) * 90), y + 52),
+            col,
+            -1,
+        )
+
+    block(
+        "HEART RATE  (open-rppg)",
+        hr[0],
+        hr[1],
+        "BPM",
+        26,
+        (80, 220, 80),
+    )
+
+    block(
+        "RESP RATE   (Chest Motion)",
+        rr[0],
+        rr[1],
+        "BrPM",
+        108,
+        (80, 180, 255),
+    )
+
+    if anomaly is not None:
+        if anomaly["critical"]:
+            col = (40, 40, 255)
+            text = f"CRITICAL: {anomaly['critical']}"
+
+        elif anomaly["state"] == "signal_lost":
+            col = (0, 165, 255)
+            text = "SIGNAL LOST"
+
+        elif anomaly["alert"]:
+            col = (60, 60, 255)
+            text = anomaly["alert_reason"] or "ANOMALY"
+
+        elif anomaly["baseline"] is None:
+            col = (150, 150, 150)
+            text = (
+                f"BASELINE "
+                f"{anomaly['progress'] * 100:.0f}%"
+            )
+
+        elif anomaly["state"] in ("invalid", "warmup"):
+            col = (0, 200, 255)
+            text = "NO VALID SIGNAL - HOLD"
+
+        else:
+            col = (80, 220, 80)
+            text = "NORMAL"
+
+        cv2.putText(
+            frame,
+            text,
+            (10, 212),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            col,
+            1,
+        )
+
+    cv2.putText(
+        frame,
+        f"FPS: {fps:.0f}",
+        (10, h - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (160, 160, 160),
+        1,
+    )
+
+    cv2.putText(
+        frame,
+        "HR:60-100  RR:12-20",
+        (w - 185, h - 10),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.42,
+        (120, 120, 120),
+        1,
+    )
+
+    return frame
+
+
+# ══════════════════════════════════════════════════════
+#  4. 메인 루프
+# ══════════════════════════════════════════════════════
+
+def run(
+    camera_id=0,
+    calib_sec=180.0,
+    min_conf=0.25,
+    out_pct=1.0,
+    rr_sigma=4.0,
+    headless=False,
+):
+    print("[INFO] open-rppg 모델 로딩 중...")
+    model = rppg.Model("ME-flow.rlap")
+    print("[INFO] 모델 로딩 완료")
+
+    show_window = should_show_window(headless)
+
+    if headless:
+        print("[INFO] 헤드리스 모드로 실행합니다.")
+    elif not show_window:
+        print("[WARN] DISPLAY가 없어 자동으로 헤드리스 모드로 실행합니다.")
+
+    vitals_hr = OpenRppgVitalTracker(model)
+    vitals_rr = ChestMotionRespirationTracker(buffer_sec=25)
+
+    detector = VitalAnomalyDetector(
+        calib_sec=calib_sec,
+        min_conf=min_conf,
+        out_pct=out_pct,
+        rr_sigma=rr_sigma,
+    )
+
+    anomaly = None
+    update_interval = 1.5  # 1.5초 주기로 활력징후 및 이상치 업데이트
+    last_update = time.time()
+
+    fps_timer = time.time()
+    frame_count = 0
+    measured_fps = 0.0
+
+    print("=" * 62)
+    print(f"  실시간 생체 모니터링 시작 (기준 학습 {calib_sec:.0f}초)")
+    print("  종료: " + ("Q / ESC 또는 Ctrl+C" if show_window else "Ctrl+C"))
+    print("=" * 62)
+
+    try:
+        with model.video_capture(camera_id):
+            for frame_rgb, box in model.preview:
+                now = time.time()
+                face_visible = box is not None
+
+                frame_count += 1
+                if now - fps_timer >= 2.0:
+                    measured_fps = frame_count / (now - fps_timer)
+                    frame_count = 0
+                    fps_timer = now
+
+                # 1. 매 프레임 호흡 추적기에 영상 및 얼굴 박스 전달
+                if face_visible:
+                    vitals_rr.update_frame(frame_rgb, box, now)
+                else:
+                    vitals_hr.invalidate()
+                    vitals_rr.invalidate()
+
+                # 2. 주기적 심박수 + 호흡수 계산 및 이상치 탐지
+                if now - last_update >= update_interval:
+                    vitals_hr.update_hr(face_visible)
+                    if face_visible:
+                        vitals_rr.compute_rr()
+
+                    anomaly = detector.push(
+                        vitals_hr.hr_bpm,
+                        vitals_hr.hr_conf,
+                        vitals_rr.rr_bpm,
+                        vitals_rr.rr_conf,
+                        now=now,
+                    )
+
+                    print(
+                        f"[HR] {vitals_hr.hr_bpm:6.1f} ({vitals_hr.hr_conf:.2f})"
+                        f"  [RR] {vitals_rr.rr_bpm:5.1f} ({vitals_rr.rr_conf:.2f})"
+                    )
+
+                    score = anomaly["score"]
+                    threshold = anomaly["threshold"]
+                    score_text = "score=-" if score is None else f"score={score:.3f}"
+                    threshold_text = "" if threshold is None else f" / 임계 {threshold:.3f}"
+                    stale = anomaly["state"] in ("invalid", "warmup")
+
+                    if anomaly["critical"]:
+                        status = f"** 절대범위 이탈: {anomaly['critical']}"
+                    elif anomaly["state"] == "signal_lost":
+                        status = "** 신호 소실 (측정 중단)"
+                    elif anomaly["alert"]:
+                        status = f"** 이상징후: {anomaly['alert_reason']}  {score_text}{threshold_text}"
+                        if stale:
+                            status += "  (현재 샘플 무효 - 알림 유지)"
+                    elif anomaly["baseline"] is None:
+                        status = (
+                            f"기준 학습: 시간 {anomaly['progress_time'] * 100:3.0f}%"
+                            f" / 샘플 {anomaly['accepted']}/{detector.min_samples}"
+                            f"  {detector.stats()}"
+                        )
+                    elif stale:
+                        status = f"판정 보류 - 유효 신호 없음 (원인={anomaly['reason'] or anomaly['state']})"
+                    else:
+                        baseline = anomaly["baseline"]
+                        status = (
+                            f"NORMAL  {score_text}{threshold_text}"
+                            f"  기준선 HR {baseline[0]:.0f} / RR {baseline[1]:.0f}"
+                        )
+
+                    print(f"  {status}")
+                    last_update = now
+
+                # 3. GUI 창 렌더링
+                if show_window:
+                    frame = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR)
+
+                    # 얼굴 박스 표시 (녹색)
+                    if box is not None:
+                        (y1, y2), (x1, x2) = box[0], box[1]
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 220, 80), 2)
+
+                    # 호흡 측정 흉부 박스 표시 (하늘색)
+                    if vitals_rr.chest_box is not None:
+                        (cy1, cy2), (cx1, cx2) = vitals_rr.chest_box
+                        cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (255, 180, 80), 1)
+
+                    frame = draw_hud(
+                        frame,
+                        (vitals_hr.hr_bpm, vitals_hr.hr_conf),
+                        (vitals_rr.rr_bpm, vitals_rr.rr_conf),
+                        measured_fps,
+                        anomaly,
+                    )
+
+                    cv2.imshow("Vital Monitor (HR: open-rppg / RR: Chest Motion)", frame)
+
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("q"), 27):
+                        print("[INFO] 종료")
+                        break
+
+    except KeyboardInterrupt:
+        print("\n[INFO] Ctrl+C 입력으로 종료합니다.")
+
+    finally:
+        if show_window:
+            cv2.destroyAllWindows()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="심박수 + 호흡수 실시간 측정")
+
+    parser.add_argument("--camera", type=int, default=0, help="카메라 ID")
+    parser.add_argument("--calib", type=float, default=180.0, help="기준 학습 초")
+    parser.add_argument("--min-conf", type=float, default=0.25, help="SQI 및 신뢰도 임계")
+    parser.add_argument("--out-pct", type=float, default=1.0, help="학습 분포 하위 몇 %%를 이상 경계로 사용할지")
+    parser.add_argument("--rr-sigma", type=float, default=4.0, help="RR 측정 불확실성(BPM)")
+    parser.add_argument("--headless", action="store_true", help="OpenCV 영상 창 없이 실행")
+
+    args, _ = parser.parse_known_args()
+
+    run(
+        camera_id=args.camera,
+        calib_sec=args.calib,
+        min_conf=args.min_conf,
+        out_pct=args.out_pct,
+        rr_sigma=args.rr_sigma,
+        headless=args.headless,
+    )
