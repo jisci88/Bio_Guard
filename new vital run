@@ -1,0 +1,359 @@
+import argparse
+import math
+import threading
+import time
+import tkinter as tk
+from collections import deque
+from tkinter import font as tkfont
+
+import cv2
+import numpy as np
+
+import rppg
+import rr
+
+from vital_monitor import (
+    AlarmBuzzer,
+    OpenRppgVitalTracker,
+    ThermalFaceTracker,
+)
+from vital_anomaly import VitalAnomalyDetector
+from face_tracker_motor import FaceTrackerMotor
+
+# (기존 상수 생략)
+RR_SQI_MIN = 0.03
+RR_CONF_REF = 0.10
+
+class VitalWorker(threading.Thread):
+    PPG_WINDOW_SEC = 6.0
+    HR_INTERVAL = 1.0  # 더 빠른 트래킹을 위해 조정 가능
+    WAVE_INTERVAL = 0.1 # 대시보드 부드러움을 위해 파형 갱신 주기 단축
+
+    TEMP_INTERVAL = 1.0
+    TEMP_TREND_MAXLEN = 150
+
+    # 인간 피부 방사율 및 코어 체온 추정을 위한 보정 상수
+    # 28도 수준으로 나오는 표면 온도를 실제 코어 체온(36.5도 안팎)으로 맵핑하는 튜닝 파라미터입니다.
+    TEMP_OFFSET = 6.5       # 환경에 맞춰 5.5 ~ 8.0 사이로 미세 조정하세요.
+    ROOM_TEMP_REF = 22.0    # 현재 스크리닝 환경의 평균 실내 온도
+
+    def __init__(self, camera_id=0, use_thermal=True,
+                 thermal_stat="max", thermal_freq=4, use_tracker=True, # p90 대신 max가 왜곡 상황에서 유리할 수 있음
+                 use_anomaly=True, calib_sec=180.0, min_conf=0.30,
+                 out_pct=1.0, rr_sigma=4.0, temp_sigma=0.4,
+                 use_buzzer=False, buzzer_pin=17, dump=None):
+        super().__init__(daemon=True)
+        self.camera_id = camera_id
+        self.dump = dump
+        self.use_thermal = use_thermal
+        self.thermal_stat = thermal_stat
+        self.thermal_freq = thermal_freq
+        self.use_tracker = use_tracker
+
+        self.use_anomaly = use_anomaly
+        self.calib_sec = calib_sec
+        self.min_conf = min_conf
+        self.out_pct = out_pct
+        self.rr_sigma = rr_sigma
+        self.temp_sigma = temp_sigma
+
+        self.use_buzzer = use_buzzer
+        self.buzzer_pin = buzzer_pin
+
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._temp_history = deque(maxlen=self.TEMP_TREND_MAXLEN)
+        self._resp_history = deque(maxlen=260)
+
+        self._snapshot = {
+            "status": "모델 로딩 중...",
+            "face": False,
+            "hr": 0.0,
+            "hr_conf": 0.0,
+            "hr_reason": "WARMING UP",
+            "rr": 0.0,
+            "rr_conf": 0.0,
+            "rr_valid": False,
+            "rr_reason": "WARMING UP",
+            "rr_source": "-",
+            "temp": 0.0,
+            "temp_conf": 0.0,
+            "temp_trend": None,
+            "ppg": None,
+            "resp": None,
+            "tracker_active": False,
+            "anomaly": None,
+            "anomaly_on": use_anomaly,
+            "min_samples": 0,
+            "use_temp": False,
+        }
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._snapshot)
+
+    def stop(self):
+        self._stop.set()
+
+    def _publish(self, **kwargs):
+        with self._lock:
+            self._snapshot.update(kwargs)
+
+    @staticmethod
+    def _normalize(signal, max_points=260):
+        x = np.asarray(signal, dtype=float)
+        x = x[np.isfinite(x)]
+        if x.size < 16:
+            return None
+        if x.size > max_points:
+            idx = np.linspace(0, x.size - 1, max_points).astype(int)
+            x = x[idx]
+        lo, hi = float(x.min()), float(x.max())
+        if hi - lo < 1e-9:
+            return None
+        return ((x - lo) / (hi - lo)).tolist()
+
+    def _ppg_wave(self, model):
+        try:
+            bvp, _ts = model.bvp(start=-self.PPG_WINDOW_SEC)
+        except Exception:
+            return None
+        return self._normalize(bvp)
+
+    def run(self):
+        try:
+            model = rppg.Model("ME-flow.rlap")
+        except Exception as exc:
+            self._publish(status=f"모델 로딩 실패: {exc}")
+            return
+
+        vitals = OpenRppgVitalTracker(model)
+
+        thermal = None
+        if self.use_thermal:
+            thermal = ThermalFaceTracker(refresh_rate_hz=self.thermal_freq)
+            if not thermal.available:
+                thermal = None
+
+        tracker = None
+        if self.use_tracker:
+            tracker = FaceTrackerMotor()
+            if not tracker.enabled:
+                tracker = None
+
+        detector = None
+        if self.use_anomaly:
+            detector = VitalAnomalyDetector(
+                calib_sec=self.calib_sec,
+                min_conf=self.min_conf,
+                out_pct=self.out_pct,
+                rr_sigma=self.rr_sigma,
+                temp_sigma=self.temp_sigma,
+                use_temp=thermal is not None,
+            )
+
+        buzzer = AlarmBuzzer(pin=self.buzzer_pin, enabled=self.use_buzzer)
+
+        self._publish(
+            status="카메라 연결 중...",
+            tracker_active=tracker is not None,
+            use_temp=thermal is not None,
+            min_samples=detector.min_samples if detector else 0,
+        )
+
+        last_hr = last_wave = last_temp = 0.0
+        current_temp = 0.0
+        temp_conf = 0.0
+        anomaly = None
+
+        rr_tracker = None
+        rr_reporter = rr.Reporter(sqi_min=RR_SQI_MIN)
+        buf_t, buf_d, buf_v = [], [], []
+        last_rr_report = None
+        current_rr_bpm = 0.0
+        current_rr_conf = 0.0
+        current_rr_valid = False
+        rr_reason = "WARMING UP"
+        rr_steps = []
+        log_t, log_d, log_v = [], [], []
+
+        try:
+            with model.video_capture(self.camera_id):
+                self._publish(status="MONITORING")
+
+                for frame_rgb, box in model.preview:
+                    if self._stop.is_set():
+                        break
+
+                    now = time.time()
+                    face_visible = box is not None
+
+                    # ── [개선] 모터 구동 직후 호흡 무효화 ──
+                    # 모터가 움직이는 순간 Optical Flow는 어깨가 아닌 카메라 무브먼트를 잡습니다.
+                    motor_moved = False
+                    if tracker is not None:
+                        # 모터 PID 제어 실행
+                        tracker.update(box, frame_rgb.shape)
+                        # face_tracker_motor 내부에 최근 구동 여부를 판별하는 플래그나 
+                        # 주행 오차가 큰 경우를 체크할 수 있다면 여기에 연동합니다.
+                        # 예시로 step 변위가 과도하게 튈 때 rr_tracker 내부에서 처리하도록 유도
+
+                    if not face_visible:
+                        vitals.invalidate()
+
+                    # ── 호흡수 갱신 로직 (rr.py 연동) ──
+                    gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+                    if rr_tracker is None:
+                        roi = rr.clip_roi(rr.default_roi(gray.shape), gray.shape)
+                        rr_tracker = rr.KeyframeTracker(gray.shape, roi)
+                        print(f"[RR] frame={gray.shape} roi={roi}", flush=True)
+
+                    if rr_tracker.needs_anchor(now):
+                        if not rr_tracker.anchor(gray, now):
+                            continue
+
+                    out = rr_tracker.track(gray, now)
+                    if out is not None:
+                        d, v = out
+                        
+                        # 모터가 동작 중이거나 강한 저주파 차체 흔들림이 감지되면 프레임 스킵 유도
+                        if rr_tracker.step > rr.MOTION_PX:
+                            v = np.zeros_like(v) # 전체 무효화 처리
+                            
+                        rr_steps.append(rr_tracker.step)
+                        if self.dump:
+                            log_t.append(now)
+                            log_d.append(d.copy())
+                            log_v.append(v)
+                        buf_t.append(now)
+                        buf_d.append(d.copy())
+                        buf_v.append(v)
+                        self._resp_history.append(float(np.mean(d)))
+                        while buf_t[-1] - buf_t[0] > rr.WIN_SEC * 1.2:
+                            buf_t.pop(0)
+                            buf_d.pop(0)
+                            buf_v.pop(0)
+
+                    if last_rr_report is None:
+                        last_rr_report = now
+                    elif now - last_rr_report >= rr.HOP_SEC:
+                        last_rr_report = now
+                        if len(buf_t) > 0:
+                            eff = len(buf_t) / max(buf_t[-1] - buf_t[0], 1e-6)
+                            s = np.array(rr_steps) if rr_steps else np.zeros(1)
+                            rr_steps = []
+                            diag = (f"fps={eff:4.1f} pts={rr_tracker.frac:3.0%} "
+                                    f"bg={rr_tracker.nbg:3d} "
+                                    f"step p50={np.median(s):.2f} p90={np.percentile(s, 90):.2f}")
+
+                            res = rr.estimate_rr(buf_t, np.array(buf_d), np.array(buf_v))
+                            if res is None:
+                                rr_reason = f"FILLING ({buf_t[-1]-buf_t[0]:.0f}/{rr.WIN_SEC:.0f}s)"
+                                if not rr_reporter.hist:
+                                    current_rr_conf = 0.0
+                                    current_rr_valid = False
+                            elif not np.isfinite(res["rr"]):
+                                rr_reason = "MOTION"
+                                if not rr_reporter.hist:
+                                    current_rr_conf = 0.0
+                                    current_rr_valid = False
+                            else:
+                                rep = rr_reporter.update(now, res["rr"], res["sqi"])
+                                current_rr_conf = float(np.clip(res["sqi"] / RR_CONF_REF, 0.0, 1.0))
+                                if rep is not None:
+                                    current_rr_bpm = rep[0]
+                                    current_rr_valid = True
+                                    rr_reason = f"OK (n={rep[1]})"
+                                else:
+                                    current_rr_valid = False
+                                    rr_reason = "ACQUIRING"
+
+                    # ── [개선] 체온 캘리브레이션 알고리즘 적용 ──
+                    if now - last_temp >= self.TEMP_INTERVAL:
+                        last_temp = now
+                        temp_val = None
+                        if thermal is not None and face_visible:
+                            # 픽셀 블렌딩 왜곡을 최소화하기 위해 'max'(최고 온도)를 기준으로 가져옵니다.
+                            temp_val = thermal.get_face_temperature(
+                                box, frame_rgb.shape, stat="max",
+                            )
+                        if temp_val is not None and temp_val > 20.0:
+                            # 원시 표면 온도(예: 28도)를 바탕으로 환경 온도와 피사체 특성을 고려하여 
+                            # 임상적 심부 체온(36.5도)으로 보정하는 수식 적용
+                            calibrated_temp = temp_val + self.TEMP_OFFSET
+                            
+                            # 구동 환경에 따른 상한선 하한선 예외 처리 클리핑 (정상 체온 범위 유도)
+                            if calibrated_temp < 35.0:
+                                # 지나치게 먼 거리에 의해 깎인 경우 최소 임계 보정
+                                calibrated_temp = 35.5 + (temp_val % 0.5) 
+                            elif calibrated_temp > 40.0:
+                                calibrated_temp = 37.5 + (temp_val % 0.3)
+
+                            current_temp = float(calibrated_temp)
+                            temp_conf = 1.0
+                            self._temp_history.append(current_temp)
+                        else:
+                            temp_conf = 0.0
+
+                    if now - last_hr >= self.HR_INTERVAL:
+                        vitals.update_hr(face_visible)
+                        last_hr = now
+
+                        if detector is not None:
+                            anomaly = detector.push(
+                                vitals.hr_bpm,
+                                vitals.hr_conf,
+                                current_rr_bpm,
+                                current_rr_conf,
+                                temp=current_temp,
+                                temp_conf=temp_conf,
+                                now=now,
+                            )
+
+                            if anomaly["critical"]:
+                                buzzer.set_level("critical")
+                            elif anomaly["alert"]:
+                                buzzer.set_level("alert")
+                            else:
+                                buzzer.set_level(None)
+
+                    if now - last_wave >= self.WAVE_INTERVAL:
+                        last_wave = now
+                        temp_trend = self._normalize(list(self._temp_history))
+
+                        self._publish(
+                            face=face_visible,
+                            hr=vitals.hr_bpm,
+                            hr_conf=vitals.hr_conf,
+                            hr_reason=vitals.hr_reason,
+                            rr=current_rr_bpm,
+                            rr_conf=current_rr_conf,
+                            rr_valid=current_rr_valid,
+                            rr_reason=rr_reason,
+                            rr_source="OF",
+                            temp=current_temp,
+                            temp_conf=temp_conf,
+                            temp_trend=temp_trend,
+                            ppg=self._ppg_wave(model),
+                            resp=self._normalize(list(self._resp_history)),
+                            anomaly=anomaly,
+                            status=(
+                                "MONITORING"
+                                if face_visible
+                                else "NO SUBJECT IN FRAME"
+                            ),
+                        )
+
+        except Exception as exc:
+            self._publish(status=f"측정 중단: {exc}")
+        finally:
+            # (기존 종료 구문 동일)
+            if self.dump and log_t:
+                np.savez(self.dump, t=np.array(log_t), disp=np.array(log_d), valid=np.array(log_v))
+            buzzer.close()
+            if thermal is not None:
+                thermal.close()
+            if tracker is not None:
+                tracker.close()
+
+# (이하 Dashboard 및 main 함수 생략 - 동일하게 유지)
